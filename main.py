@@ -22,11 +22,7 @@ logger = logging.getLogger(__name__)
 # 设备信息
 DEVICE_NAMES = [
     "HUAWEI FreeBuds SE 2",
-    "FreeBuds SE 2",
-    "HUAWEI FreeBuds",
-    "FreeBuds",
-    "华为",
-    "HUAWEI"
+    "FreeBuds SE 2"
 ]
 DEVICE_ADDRESSES = [
     "90:F6:44:AA:EE:67",  # 需要替换为您耳机的实际MAC地址
@@ -315,9 +311,8 @@ class FreeBudsWindow(QMainWindow):
                 device_info.append("    " + parse_manufacturer_data(data))
                 # 检查是否是华为设备
                 if company_id == HUAWEI_COMPANY_ID:
-                    logger.debug(f"通过制造商ID匹配到华为设备: {device.name} ({device.address})")
-                    self.device_info_label.setText("设备详细信息:\n" + "\n".join(device_info))
-                    return True
+                    logger.debug(f"发现华为设备: {device.name} ({device.address})")
+                    # 仅记录，不直接作为目标设备返回
         
         # 检查广播数据
         if device.metadata.get("uuids"):
@@ -326,9 +321,8 @@ class FreeBudsWindow(QMainWindow):
                 device_info.append(f"  {uuid}")
                 # 检查是否包含目标服务
                 if uuid.lower() in TARGET_SERVICE_UUIDS:
-                    logger.debug(f"通过服务UUID匹配到目标设备: {device.name} ({device.address})")
-                    self.device_info_label.setText("设备详细信息:\n" + "\n".join(device_info))
-                    return True
+                    logger.debug(f"发现包含目标服务的设备: {device.name} ({device.address})")
+                    # 仅记录，不直接作为目标设备返回
             
         # 检查设备地址
         device_addresses = normalize_address(device.address)
@@ -426,6 +420,21 @@ class FreeBudsWindow(QMainWindow):
 
             # 如果找到目标设备，显示连接确认对话框
             if target_device:
+                # 检查是否已经连接到该设备
+                if self.client and self.client.is_connected and self.client.address == target_device.address:
+                    logger.debug(f"已连接到目标设备: {target_device.address}，跳过连接对话框")
+                    self.status_label.setText(f"状态: 已连接 - {target_device.name or target_device.address}")
+                    self.debug_label.setText("调试信息: 已连接，正在更新数据...")
+                    
+                    # 停止扫描
+                    self.scanning_enabled = False
+                    self.timer.stop()
+                    self.scan_button.setText("恢复扫描")
+                    
+                    # 更新电量
+                    await self.read_battery_level()
+                    return
+
                 # 在主线程中显示对话框
                 should_connect = await asyncio.get_event_loop().run_in_executor(
                     None,
@@ -470,7 +479,14 @@ class FreeBudsWindow(QMainWindow):
 
     async def connect_device(self, device):
         try:
-            # 如果已经连接，先断开
+            # 如果已经连接到同一设备，直接返回
+            if self.client and self.client.is_connected and self.client.address == device.address:
+                logger.debug("已连接到该设备，无需重新连接")
+                self.status_label.setText(f"状态: 已连接 - {device.name or device.address}")
+                await self.read_battery_level()
+                return
+
+            # 如果已经连接到其他设备，先断开
             if self.client and self.client.is_connected:
                 logger.debug("断开现有连接")
                 await self.client.disconnect()
