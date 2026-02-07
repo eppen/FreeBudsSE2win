@@ -4,8 +4,10 @@ import struct
 import time
 from datetime import datetime
 from bleak import BleakScanner, BleakClient, BleakError
-from PyQt6.QtWidgets import QApplication, QMainWindow, QWidget, QVBoxLayout, QLabel, QMessageBox, QPushButton, QHBoxLayout, QScrollArea, QFrame
-from PyQt6.QtCore import QTimer, QThread, Qt
+from PyQt6.QtWidgets import QApplication, QMainWindow, QWidget, QVBoxLayout, QLabel, QMessageBox, QPushButton, QHBoxLayout, QScrollArea, QFrame, QGroupBox, QCheckBox
+from PyQt6.QtCore import QTimer, QThread, Qt, pyqtSignal
+from popup import BatteryPopup
+from huawei_spp import HuaweiSPPClient
 import sys
 
 # 配置日志
@@ -46,6 +48,35 @@ def normalize_address(address):
         "-".join(clean_addr[i:i+2] for i in range(0, 12, 2)),  # 带横杠
         clean_addr  # 无分隔符
     ]
+
+def extract_battery_info(manufacturer_data):
+    """
+    尝试从制造商数据中提取电量信息 (L, R, Case)
+    返回 (left, right, case) 或者 None
+    """
+    for cid, data in manufacturer_data.items():
+        # 常见华为/FreeBuds ID: 0x0156 (Huawei), 0x025D (Huawei HiLink?), 0x004C (Apple spoof)
+        # 尝试多种解析策略
+        data_hex = data.hex()
+        
+        # 策略1: 常见FreeBuds位置 (假设)
+        # 许多华为耳机在 0x0156 或 0x004C 下广播
+        # 如果数据长度足够，尝试读取常见偏移量
+        # 这里使用一种通用查找: 寻找连续的电量值
+        
+        # 调试: 如果想看原始数据，可以在日志输出
+        # logger.debug(f"Hex ({cid:04x}): {data_hex}")
+        
+        # 假设格式: ... L R Case ... (具体偏移需抓包确认，这里使用假设或基于开源库)
+        # 根据 FreeBuds-Lite-Battery-Level 等项目
+        # 可能是 偏移量 7, 8, 9 或类似的
+        # 这是一个简化的假设，用户可能需要根据实际日志调整
+        if len(data) >= 10:
+             # 仅作为示例，实际需要根据设备具体协议
+             # FreeBuds SE 2 可能类似
+             pass
+             
+    return None
 
 def parse_manufacturer_data(data):
     """解析制造商数据"""
@@ -107,6 +138,57 @@ class AsyncThread(QThread):
             except Exception as e:
                 logger.error(f"停止异步线程时出错: {e}")
 
+class SPPWorker(QThread):
+    status_changed = pyqtSignal(str)
+    battery_received = pyqtSignal(int, int, int)
+    
+    def __init__(self, address):
+        super().__init__()
+        self.address = address
+        self.client = HuaweiSPPClient(address)
+        self.command_queue = [] # List of (cmd, val)
+        self.running = True
+        
+    def run(self):
+        self.status_changed.emit("正在尝试建立SPP连接...")
+        if self.client.connect():
+            self.status_changed.emit("SPP已连接")
+        else:
+            self.status_changed.emit("SPP连接失败. 请确保设备已配对")
+            return
+
+        while self.running:
+            if self.command_queue:
+                cmd, val = self.command_queue.pop(0)
+                try:
+                    if cmd == 'get_battery':
+                        self.status_changed.emit("正在读取电量...")
+                        res = self.client.get_battery()
+                        if res and 'left' in res:
+                            self.battery_received.emit(res['left'], res['right'], res['case'])
+                            self.status_changed.emit("已主动更新电量")
+                        else:
+                            self.status_changed.emit("读取电量失败 (无响应)")
+                            
+                    elif cmd == 'set_low_latency':
+                        self.client.set_low_latency(val)
+                        self.status_changed.emit(f"低延迟模式已{'开启' if val else '关闭'}")
+                        
+                except Exception as e:
+                    self.status_changed.emit(f"命令执行失败: {e}")
+            
+            time.sleep(0.1)
+            
+        self.client.disconnect()
+        self.status_changed.emit("SPP已断开")
+
+    def queue_command(self, cmd, val=None):
+        self.command_queue.append((cmd, val))
+
+    def stop(self):
+        self.running = False
+
+
 class DeviceWidget(QFrame):
     """单个设备的显示组件"""
     def __init__(self, device_name, device_info, parent=None):
@@ -163,9 +245,13 @@ def catch_exception(f):
     return wrapper
 
 class FreeBudsWindow(QMainWindow):
+    battery_signal = pyqtSignal(int, int, int)
+
     def __init__(self):
         try:
             super().__init__()
+            self.battery_signal.connect(self.update_battery_popup)
+            self.popup = BatteryPopup() 
             logger.debug("开始初始化主窗口...")
             self.setWindowTitle("FreeBuds SE 2 监控")
             self.setGeometry(100, 100, 600, 800)  # 增加窗口大小
@@ -201,6 +287,29 @@ class FreeBudsWindow(QMainWindow):
             layout.addWidget(self.case_battery_label)
             layout.addWidget(self.debug_label)
             layout.addWidget(self.scan_time_label)
+
+            # SPP Controls
+            spp_group = QGroupBox("主动控制 (需在Windows已配对)")
+            spp_layout = QVBoxLayout()
+            
+            spp_btn_layout = QHBoxLayout()
+            self.btn_spp_connect = QPushButton("连接 (SPP)")
+            self.btn_spp_connect.clicked.connect(self.toggle_spp_connection)
+            self.btn_spp_refresh_bat = QPushButton("读取电量")
+            self.btn_spp_refresh_bat.clicked.connect(self.spp_refresh_battery)
+            self.btn_spp_refresh_bat.setEnabled(False)
+            
+            spp_btn_layout.addWidget(self.btn_spp_connect)
+            spp_btn_layout.addWidget(self.btn_spp_refresh_bat)
+            
+            self.chk_low_latency = QCheckBox("低延迟 (游戏) 模式")
+            self.chk_low_latency.setEnabled(False)
+            self.chk_low_latency.clicked.connect(self.spp_set_low_latency)
+            
+            spp_layout.addLayout(spp_btn_layout)
+            spp_layout.addWidget(self.chk_low_latency)
+            spp_group.setLayout(spp_layout)
+            layout.addWidget(spp_group)
 
             # 创建设备列表区域
             devices_group = QWidget()
@@ -242,7 +351,12 @@ class FreeBudsWindow(QMainWindow):
         # 设置定时器定期扫描设备
         self.timer = QTimer()
         self.timer.timeout.connect(self.start_scan)
-        self.timer.start(3000)  # 每3秒扫描一次
+        # self.timer.start(3000)  # 不再需要定期触发，因为我们改用了continuous scanning
+        # 仅触发一次启动
+        QTimer.singleShot(1000, self.start_scan)
+
+        # 初始化SPP Worker
+        self.spp_worker = None
 
         # 初始化变量
         self.last_connected_address = None
@@ -290,6 +404,67 @@ class FreeBudsWindow(QMainWindow):
 
         except Exception as e:
             logger.error(f"更新设备列表时出错: {e}")
+
+    def toggle_spp_connection(self):
+        if self.spp_worker and self.spp_worker.running:
+            # Disconnect
+            self.spp_worker.stop()
+            self.spp_worker.wait()
+            self.spp_worker = None
+            self.btn_spp_connect.setText("连接 (SPP)")
+            self.btn_spp_refresh_bat.setEnabled(False)
+            self.chk_low_latency.setEnabled(False)
+            self.debug_label.setText("调试信息: SPP已断开")
+        else:
+            # Connect
+            # Try to use discovered address or first default
+            target_addr = None
+            
+            # 1. Try last BLE discovered specific target
+            # Not easy to get from here unless we stored it. 
+            # We check found_devices
+            for d in self.found_devices:
+                 norm_addr = normalize_address(d.address)
+                 if any(target in norm_addr for target in [normalize_address(a)[2] for a in DEVICE_ADDRESSES]):
+                     target_addr = d.address
+                     break
+            
+            # 2. Fallback to first configured address
+            if not target_addr:
+                target_addr = DEVICE_ADDRESSES[0]
+            
+            self.spp_worker = SPPWorker(target_addr)
+            self.spp_worker.status_changed.connect(lambda s: self.debug_label.setText(f"SPP: {s}"))
+            self.spp_worker.status_changed.connect(self.check_spp_connection_ui)
+            self.spp_worker.battery_received.connect(self.update_battery_popup)
+            self.spp_worker.start()
+            self.btn_spp_connect.setText("断开 (SPP)")
+
+    def check_spp_connection_ui(self, status_msg):
+        if "已连接" in status_msg:
+            self.btn_spp_refresh_bat.setEnabled(True)
+            self.chk_low_latency.setEnabled(True)
+            
+            # SPP连接成功后，自动暂停BLE扫描以节省资源
+            if self.scanning_enabled:
+                self.scanning_enabled = False
+                self.scan_button.setText("恢复扫描")
+                logger.debug("SPP已连接，自动暂停BLE扫描")
+
+        elif "失败" in status_msg or "断开" in status_msg:
+            self.btn_spp_refresh_bat.setEnabled(False)
+            self.chk_low_latency.setEnabled(False)
+            if self.spp_worker and not self.spp_worker.running:
+                 self.btn_spp_connect.setText("连接 (SPP)")
+
+    def spp_refresh_battery(self):
+        if self.spp_worker:
+            self.spp_worker.queue_command('get_battery')
+
+    def spp_set_low_latency(self):
+        if self.spp_worker:
+            enabled = self.chk_low_latency.isChecked()
+            self.spp_worker.queue_command('set_low_latency', enabled)
 
     def is_target_device(self, device):
         """检查是否是目标设备"""
@@ -343,139 +518,113 @@ class FreeBudsWindow(QMainWindow):
         self.device_info_label.setText("设备详细信息:\n" + "\n".join(device_info))
         return False
 
+    def update_battery_popup(self, left, right, case):
+        if self.popup:
+            self.popup.update_batteries(left, right, case)
+            if left <= 100: self.left_battery_label.setText(f"左耳机电量: {left}%")
+            if right <= 100: self.right_battery_label.setText(f"右耳机电量: {right}%")
+            if case <= 100: self.case_battery_label.setText(f"充电盒电量: {case}%")
+            
+            self.status_label.setText(f"状态: 监测到设备广播 (L:{left}% R:{right}% Case:{case}%)")
+
+    def parse_battery_from_adv(self, advertisement_data):
+        """解析广播数据中的电量信息"""
+        if not advertisement_data.manufacturer_data:
+            return None
+            
+        for cid, data in advertisement_data.manufacturer_data.items():
+            # 简单启发式解析：查找看起来像电量的3个字节 (L, R, Case)
+            # 这里的逻辑是尝试找到符合 FreeBuds 特征的数据
+            # 1. 长度检查
+            if len(data) < 7: continue 
+            
+            # 2. 尝试常见偏移量 (例如很多华为设备在偏移量 2,3,4 或 7,8,9 等)
+            # 由于没有确切文档，我们扫描数据寻找可能的电量组合
+            # 电量通常为 0-100，或者 255 (未知/未放入)
+            
+            # 使用滑动窗口查找
+            data_bytes = list(data)
+            for i in range(len(data_bytes) - 2):
+                l, r, c = data_bytes[i], data_bytes[i+1], data_bytes[i+2]
+                
+                # 验证是否为合理电量值 (0-100 或 255)
+                valid_l = (0 <= l <= 100) or l == 255
+                valid_r = (0 <= r <= 100) or r == 255
+                valid_c = (0 <= c <= 100) or c == 255
+                
+                # 必须至少有一个有效且非255的值 (避免误判)
+                has_value = (0 <= l <= 100) or (0 <= r <= 100) or (0 <= c <= 100)
+                
+                if valid_l and valid_r and valid_c and has_value:
+                    if cid == 0x0156 or cid == 0x025D: # 优先匹配华为ID
+                        return (l, r, c)
+                        
+            # 如果仅仅是 0x0156 且没找到明显连续字节，尝试 0x4C (Apple) 格式
+            # (有些 FreeBuds 伪装成 AirPods)
+            if cid == 0x004C:
+                # Apple battery format usually: length 27 ish
+                pass
+                
+        return None
+
     @catch_exception
     async def scan_devices(self):
-        try:
-            logger.debug("开始扫描设备...")
-            self.debug_label.setText("调试信息: 正在扫描设备...")
-            scan_start_time = datetime.now()
+        if hasattr(self, '_is_scanning') and self._is_scanning:
+            return
 
-            # 使用 BleakScanner 扫描设备
-            devices = await BleakScanner.discover(timeout=5.0)
-            
-            # 更新扫描时间
-            scan_end_time = datetime.now()
-            scan_duration = (scan_end_time - scan_start_time).total_seconds()
-            self.scan_time_label.setText(
-                f"上次扫描时间: {scan_end_time.strftime('%H:%M:%S')}\n"
-                f"扫描用时: {scan_duration:.1f}秒"
-            )
-            
-            # 清空设备列表
-            self.found_devices = []
-            target_devices_info = []
-            other_devices_info = []
-            target_device = None
-            
-            # 收集所有发现的设备信息
-            for device in devices:
-                try:
-                    if device.name or device.address:
-                        logger.debug(f"处理设备: {device.name or '未知'} ({device.address})")
-                        self.found_devices.append(device)
-                        
-                        device_name = f"{device.name or '未知'} ({device.address})"
-                        details = self.get_device_details(device)
-                        
-                        # 检查是否是目标设备
-                        if self.is_target_device(device):
-                            target_devices_info.append((f"[目标设备] {device_name}", details))
-                            target_device = device
-                            self.status_label.setText(f"状态: 现发目标设备 - {device.name or device.address}")
-                            # 停止扫描
-                            self.scanning_enabled = False
-                            self.timer.stop()
-                            self.scan_button.setText("恢复扫描")
-                            break  # 找到目标设备后立即停止扫描
-                        else:
-                            other_devices_info.append((device_name, details))
-                except Exception as e:
-                    logger.error(f"处理设备时出错: {e}")
-                    continue
+        self._is_scanning = True
+        logger.debug("启动持续扫描模式...")
+        self.debug_label.setText("调试信息: 正在监听广播数据(Pop-up模式)...")
+        self.scan_time_label.setText("扫描模式: 持续后台监听")
 
-            # 更新设备列表显示
+        def detection_callback(device, advertisement_data):
             try:
-                devices_info = []
+                # 检查是否为目标设备
+                is_target = False
                 
-                # 添加目标设备（如果有）
-                if target_devices_info:
-                    devices_info.append(("=== 目标设备 ===", ""))
-                    devices_info.extend(target_devices_info)
+                # 地址检查
+                if device.address:
+                    norm_addr = normalize_address(device.address)
+                    if any(target in norm_addr for target in [normalize_address(a)[2] for a in DEVICE_ADDRESSES]):
+                        is_target = True
                 
-                # 添加其他设备
-                if other_devices_info:
-                    if devices_info:  # 如果已经有目标设备，添加分隔
-                        devices_info.append(("", ""))
-                    devices_info.append(("=== 其他设备 ===", ""))
-                    devices_info.extend(other_devices_info)
+                # 名称检查
+                if not is_target and device.name:
+                    if any(n in device.name for n in DEVICE_NAMES):
+                        is_target = True
                 
-                if devices_info:
-                    logger.debug(f"更新设备列表，目标设备: {len(target_devices_info)}，其他设备: {len(other_devices_info)}")
-                    self.update_device_list(devices_info)
-                else:
-                    logger.debug("未发现任何设备")
-                    self.update_device_list([("无设备", "未发现任何蓝牙设备")])
+                if is_target:
+                    # 尝试解析电量
+                    bat_info = self.parse_battery_from_adv(advertisement_data)
+                    if bat_info:
+                        l, r, c = bat_info
+                        self.battery_signal.emit(l, r, c)
+                        logger.debug(f"收到电量广播: L={l} R={r} C={c}")
+                        
+                        # 可以在这里更新UI显示的"上次活动时间"等
             except Exception as e:
-                logger.error(f"更新设备列表显示时出错: {e}")
+                logger.error(f"回调处理错误: {e}")
 
-            # 如果找到目标设备，显示连接确认对话框
-            if target_device:
-                # 检查是否已经连接到该设备
-                if self.client and self.client.is_connected and self.client.address == target_device.address:
-                    logger.debug(f"已连接到目标设备: {target_device.address}，跳过连接对话框")
-                    self.status_label.setText(f"状态: 已连接 - {target_device.name or target_device.address}")
-                    self.debug_label.setText("调试信息: 已连接，正在更新数据...")
-                    
-                    # 停止扫描
-                    self.scanning_enabled = False
-                    self.timer.stop()
-                    self.scan_button.setText("恢复扫描")
-                    
-                    # 更新电量
-                    await self.read_battery_level()
-                    return
-
-                # 在主线程中显示对话框
-                should_connect = await asyncio.get_event_loop().run_in_executor(
-                    None,
-                    lambda: self.show_connection_dialog(target_device)
-                )
+        try:
+            self.scanner = BleakScanner(detection_callback=detection_callback)
+            await self.scanner.start()
+            
+            while self.scanning_enabled:
+                await asyncio.sleep(1)
                 
-                # 更新调试信息
-                self.debug_label.setText(f"调试信息: 用户选择{'连接' if should_connect else '取消连接'}")
-                
-                if should_connect:
-                    try:
-                        # 显示连接中状态
-                        self.status_label.setText(f"状态: 正在连接 {target_device.name or target_device.address}...")
-                        self.debug_label.setText("调试信息: 正在连接设备...")
-                        
-                        # 执行连接
-                        await self.connect_device(target_device)
-                        
-                        # 更新状态
-                        if self.client and self.client.is_connected:
-                            self.status_label.setText(f"状态: 已连接 - {target_device.name or target_device.address}")
-                            self.debug_label.setText("调试信息: 连接成功")
-                        else:
-                            self.status_label.setText("状态: 连接失败")
-                            self.debug_label.setText("调试信息: 连接失败，请重试")
-                            
-                    except Exception as e:
-                        logger.error(f"连接设备失败: {e}")
-                        self.debug_label.setText(f"调试信息: 连接失败 - {str(e)}")
-                        self.status_label.setText("状态: 连接失败")
-                        # 恢复扫描
-                        QTimer.singleShot(1000, self.resume_scanning)
-                else:
-                    self.debug_label.setText("调试信息: 用户取消了连接")
-                    # 恢复扫描
-                    QTimer.singleShot(1000, self.resume_scanning)
-        
+            await self.scanner.stop()
+            
         except Exception as e:
-            logger.exception("扫描设备时出错")
-            self.debug_label.setText(f"调试信息: 扫描出错 - {str(e)}")
-            QTimer.singleShot(1000, self.resume_scanning)
+            logger.error(f"扫描异常: {e}")
+            self.debug_label.setText(f"扫描出错: {e}")
+        finally:
+            if hasattr(self, 'scanner'):
+                try:
+                    await self.scanner.stop()
+                except:
+                    pass
+            self._is_scanning = False
+
 
     async def connect_device(self, device):
         try:
@@ -638,26 +787,34 @@ class FreeBudsWindow(QMainWindow):
         """开始扫描"""
         try:
             if not self.scanning_enabled:
-                logger.debug("扫描已禁用")
+                logger.debug("扫描已禁用，重新启用")
+                self.scanning_enabled = True
+            
+            # 如果已经在扫描中，不再重复启动
+            if hasattr(self, '_is_scanning') and self._is_scanning:
+                logger.debug("扫描已在运行中")
                 return
-                
+
             if not self.async_thread or not self.async_thread.loop:
                 logger.error("异步线程或事件循环未初始化")
                 self.init_other_components()
                 return
-                
+            
             asyncio.run_coroutine_threadsafe(self.scan_devices(), self.async_thread.loop)
         except Exception as e:
             logger.exception("启动扫描时出错")
             self.debug_label.setText(f"调试信息: 启动扫描出错 - {str(e)}")
-            QTimer.singleShot(3000, self.resume_scanning)
+
 
     def resume_scanning(self):
         """恢复扫描"""
         try:
             # 恢复扫描
             logger.debug("恢复扫描")
+            self.scanning_enabled = True
+            self.start_scan()
             self.status_label.setText("状态: 扫描已恢复")
+            self.scan_button.setText("暂停扫描")
             self.scanning_enabled = True
             if not self.timer.isActive():
                 self.timer.start()
@@ -715,11 +872,12 @@ class FreeBudsWindow(QMainWindow):
             self.scanning_enabled = False
             self.timer.stop()
             self.scan_button.setText("恢复扫描")
-            self.debug_label.setText("调试信息: 扫描已暂停")
+            self.debug_label.setText("调试信息: 正在停止扫描...")
         else:
             # 恢复扫描
             self.scanning_enabled = True
-            self.timer.start()
+            # self.timer.start() 
+            self.start_scan()
             self.scan_button.setText("暂停扫描")
             self.debug_label.setText("调试信息: 扫描已恢复")
 
